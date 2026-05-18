@@ -7,7 +7,7 @@ Bot Telegram yang memonitor proses mining Keryx (KRX) dan mengirim notifikasi se
 - 🚀 Notifikasi real-time saat block ditemukan
 - ⚡ Menampilkan hashrate terkini
 - 🍥 Tracking jumlah block per session
-- 💰 Earned per session dihitung otomatis dari selisih balance (query node RPC)
+- 💰 Earned per session dihitung otomatis dari coinbase log miner (fallback: query node RPC)
 - ✅ Notifikasi saat bot start
 
 ## Instalasi (Ubuntu VPS)
@@ -16,8 +16,8 @@ Bot Telegram yang memonitor proses mining Keryx (KRX) dan mengirim notifikasi se
 
 ```bash
 cd ~
-git clone https://github.com/USERNAME/kryx-bot.git
-cd kryx-bot
+git clone https://github.com/wakjemmm/keryxnotif.git
+cd keryxnotif
 ```
 
 ### 2. Install Python & dependencies
@@ -41,11 +41,12 @@ Isi dengan data kamu:
 ```env
 TELEGRAM_BOT_TOKEN=123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11
 TELEGRAM_CHAT_ID=123456789
-MODE=pipe
+MODE=logfile
 MINING_ADDRESS=keryx:your_address_here
 MINER_EXECUTABLE=/root/keryx-miner/target/release/keryx-miner
 LOG_FILE_PATH=/root/keryx-miner/miner.log
 KERYX_NODE_RPC=http://127.0.0.1:24110
+CUDA_WORKLOAD=1024
 ```
 
 ### 4. Mendapatkan Telegram Bot Token & Chat ID
@@ -58,62 +59,57 @@ KERYX_NODE_RPC=http://127.0.0.1:24110
 ### 5. Pastikan Node & Miner sudah jalan
 
 ```bash
+# Start node
+screen -dmS keryx-node /root/keryx-node/target/release/keryxd --utxoindex --rpclisten=127.0.0.1:22110 --rpclisten-json=127.0.0.1:24110 --unsaferpc --yes
+
 # Cek node sudah sync (tidak ada "IBD:" lagi)
 screen -S keryx-node -X hardcopy /tmp/n.log && grep IBD /tmp/n.log | tail -3
-
-# Jika masih IBD, tunggu sampai selesai
 ```
 
-## Menjalankan Bot
+## Menjalankan
 
-### Mode Pipe (Recommended)
-
-Bot langsung menjalankan miner dan membaca output-nya. Tidak perlu jalankan miner terpisah.
+### 1. Start Miner (dengan log file)
 
 ```bash
-cd ~/kryx-bot
-source venv/bin/activate
-python3 bot.py
-```
-
-### Mode Logfile
-
-Jalankan miner terpisah dengan redirect ke log file, lalu bot monitor file tersebut.
-
-```bash
-# Terminal 1: jalankan miner
-cd ~/keryx-miner
+cd /root/keryx-miner
 export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/usr/local/cuda-12.6/lib64:./target/release
-./target/release/keryx-miner --mining-address "keryx:ADDRESS" 2>&1 | tee ~/keryx-miner/miner.log
-
-# Terminal 2: jalankan bot
-cd ~/kryx-bot
-source venv/bin/activate
-MODE=logfile python3 bot.py
+screen -dmS km bash -c './target/release/keryx-miner --mining-address "keryx:ADDRESS_KAMU" --cuda-workload 1024 2>&1 | tee /root/keryx-miner/miner.log'
 ```
 
-### Jalankan di Background (screen)
+### 2. Start Bot
 
 ```bash
-cd ~/kryx-bot
+cd ~/keryxnotif
 screen -dmS kryx-bot bash -c 'source venv/bin/activate && python3 bot.py'
 ```
 
-Cek bot:
+### Cek Status
+
 ```bash
+# Cek miner
+screen -r km
+
+# Cek bot
 screen -r kryx-bot
+
+# Detach: Ctrl+A lalu D
 ```
 
-Detach: `Ctrl+A` lalu `D`
+## Mode Operasi
+
+| Mode | Deskripsi |
+|------|-----------|
+| `logfile` | Bot monitor file log miner. Miner jalan terpisah. **(Recommended)** |
+| `pipe` | Bot langsung jalankan miner dan baca stdout-nya. |
 
 ## Cara Kerja Reward
 
-Bot menghitung earned per session dengan cara:
-1. Saat start, query balance awal dari node RPC (`getBalanceByAddress`)
-2. Setiap block ditemukan, query balance lagi
-3. Selisih = reward block tersebut
+Bot menghitung earned per session dengan 2 cara:
 
-Jika node RPC belum tersedia (masih sync), earned akan ditampilkan setelah RPC available.
+1. **Dari log miner (utama):** Parse `EscrowWatcher: tracked escrow coinbase... amount=XXX` yang muncul setelah block ditemukan
+2. **Dari node RPC (fallback):** Query `getBalanceByAddress` dan hitung selisih balance
+
+Jika keduanya belum tersedia, earned ditampilkan sebagai "querying..." sampai data available.
 
 ## Tested On
 
@@ -123,18 +119,21 @@ Jika node RPC belum tersedia (masih sync), earned akan ditampilkan setelah RPC a
 | Driver | NVIDIA 580.142 |
 | CUDA | 13.0 |
 | OS | Ubuntu (VPS) |
-| Miner | keryx-miner (GPU, --cuda-workload 1024) |
+| Miner | keryx-miner GPU (--cuda-workload 1024) |
+| Hashrate | ~558 Mhash/s |
 
 ## Troubleshooting
 
 **Bot tidak detect block:**
 - Pastikan format log miner sesuai: `[... INFO keryx_miner::pow] Found a block: HASH`
 - Cek miner jalan: `screen -r km`
+- Pastikan miner di-redirect ke log: `2>&1 | tee /root/keryx-miner/miner.log`
 
-**Earned selalu 0:**
+**Earned selalu "querying...":**
 - Pastikan node sudah fully synced (tidak ada IBD)
-- Cek node RPC: `curl -X POST http://127.0.0.1:24110 -d '{"jsonrpc":"2.0","id":1,"method":"getBalanceByAddress","params":{"address":"keryx:..."}}'`
+- Atau tunggu block berikutnya — reward diambil dari coinbase log
 
 **Telegram tidak terkirim:**
 - Cek token & chat ID di `.env`
 - Pastikan sudah kirim pesan ke bot dulu sebelum bot bisa reply
+- Test: `curl https://api.telegram.org/bot<TOKEN>/getMe`
