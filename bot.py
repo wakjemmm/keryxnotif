@@ -174,6 +174,16 @@ class LogParser:
         r"\[(.+?)\s+INFO\s+keryx_miner::pow\]\s+Found a block:\s+(\w+)"
     )
 
+    # [timestamp INFO keryx_miner::client::grpc] block submitted successfully!
+    BLOCK_SUBMITTED_PATTERN = re.compile(
+        r"\[.+?\s+INFO\s+keryx_miner::client::grpc\]\s+block submitted successfully"
+    )
+
+    # [timestamp INFO keryx_miner::escrow] EscrowWatcher: tracked escrow coinbase=HASH amount=SOMPI
+    COINBASE_PATTERN = re.compile(
+        r"\[.+?\s+INFO\s+keryx_miner::escrow\]\s+EscrowWatcher:.*?amount=(\d+)"
+    )
+
     def parse_line(self, line: str):
         """Parse a log line. Returns (type, data) or (None, None)."""
         line = line.strip()
@@ -196,6 +206,13 @@ class LogParser:
                 "raw": line,
             }
 
+        match = self.COINBASE_PATTERN.search(line)
+        if match:
+            amount_sompi = int(match.group(1))
+            return "coinbase", {
+                "amount": amount_sompi / 100_000_000,
+            }
+
         return None, None
 
 
@@ -209,6 +226,8 @@ class MinerMonitor:
         self.balance_tracker = BalanceTracker(KERYX_NODE_RPC, MINING_ADDRESS)
         self.last_hashrate_line = ""
         self.running = True
+        self.pending_block = None  # block yang menunggu coinbase info
+        self.coinbase_after_block = 0.0
 
     async def handle_line(self, line: str):
         """Process a single log line."""
@@ -219,27 +238,56 @@ class MinerMonitor:
             self.stats.update_hashrate(data["hashrate"])
             print(f"[HASHRATE] {data['hashrate']}")
 
+            # Jika ada pending block yang belum dikirim notif (coinbase sudah masuk)
+            if self.pending_block and self.coinbase_after_block > 0:
+                await self._send_block_notification()
+
+        elif line_type == "coinbase":
+            self.coinbase_after_block += data["amount"]
+            print(f"[COINBASE] +{data['amount']} KRX (total: {self.coinbase_after_block})")
+
         elif line_type == "block":
-            # Query reward dari node (balance diff)
+            # Kirim notif block sebelumnya jika masih pending
+            if self.pending_block:
+                await self._send_block_notification()
+
+            # Simpan block baru, tunggu coinbase
+            self.pending_block = data
+            self.coinbase_after_block = 0.0
+            print(f"[BLOCK FOUND] {data['hash'][:20]}... waiting for coinbase...")
+
+    async def _send_block_notification(self):
+        """Send notification for pending block."""
+        if not self.pending_block:
+            return
+
+        data = self.pending_block
+        reward = self.coinbase_after_block
+
+        # Fallback ke balance tracker jika coinbase 0
+        if reward == 0:
             reward = await self.balance_tracker.get_block_reward()
 
-            self.stats.add_block(data["hash"], reward)
+        self.stats.add_block(data["hash"], reward)
 
-            # Update total dari balance tracker
-            session_earned = self.balance_tracker.get_session_earned()
-            if session_earned > 0:
-                self.stats.total_earned = round(session_earned, 2)
+        # Update total dari balance tracker jika available
+        session_earned = self.balance_tracker.get_session_earned()
+        if session_earned > 0:
+            self.stats.total_earned = round(session_earned, 2)
 
-            print(
-                f"[BLOCK #{self.stats.blocks_found}] {data['hash']} "
-                f"| Reward: {reward} KRX | Total: {self.stats.total_earned} KRX"
-            )
+        print(
+            f"[BLOCK #{self.stats.blocks_found}] {data['hash'][:20]}... "
+            f"| Reward: {reward} KRX | Total: {self.stats.total_earned} KRX"
+        )
 
-            await self.notifier.send_block_found(
-                self.stats,
-                hashrate_line=self.last_hashrate_line,
-                block_line=data["raw"],
-            )
+        await self.notifier.send_block_found(
+            self.stats,
+            hashrate_line=self.last_hashrate_line,
+            block_line=data["raw"],
+        )
+
+        self.pending_block = None
+        self.coinbase_after_block = 0.0
 
     async def monitor_pipe(self):
         """Run miner as subprocess and monitor stdout."""
@@ -252,6 +300,7 @@ class MinerMonitor:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             env=MINER_ENV,
+            limit=1024 * 1024,  # 1MB buffer limit per line
         )
 
         print(f"[INFO] Miner started with PID: {process.pid}")
