@@ -3,15 +3,13 @@ Keryx Miner Telegram Monitor Bot
 Memonitor output miner Keryx dan mengirim notifikasi ke Telegram
 setiap kali block baru ditemukan.
 
-Reward dihitung dari balance query ke node RPC (JSON-RPC port 24110).
-Reward per block bervariasi, tidak fixed.
+Reward dihitung dari selisih balance via query ke Keryx node RPC.
 """
 
 import asyncio
 import re
 import os
 import sys
-import json
 import signal
 from datetime import datetime, timezone
 
@@ -23,6 +21,7 @@ from config import (
     MODE,
     MINER_EXECUTABLE,
     MINER_ARGS,
+    MINER_ENV,
     LOG_FILE_PATH,
     KERYX_NODE_RPC,
     MINING_ADDRESS,
@@ -30,7 +29,7 @@ from config import (
 
 
 class BalanceTracker:
-    """Track balance changes via Keryx node JSON-RPC (port 24110)."""
+    """Track balance changes via Keryx node JSON-RPC."""
 
     def __init__(self, rpc_url: str, address: str):
         self.rpc_url = rpc_url
@@ -40,11 +39,10 @@ class BalanceTracker:
 
     async def get_balance(self) -> float:
         """Query balance from Keryx node via JSON-RPC."""
-        if not self.rpc_url:
+        if not self.rpc_url or not self.address:
             return 0.0
 
         try:
-            # Kaspa-style JSON-RPC: getBalanceByAddress
             payload = {
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -57,7 +55,6 @@ class BalanceTracker:
                 if resp.status_code == 200:
                     data = resp.json()
                     if "result" in data:
-                        # Balance dalam sompi (1 KRX = 100_000_000 sompi)
                         balance_sompi = int(data["result"].get("balance", 0))
                         return balance_sompi / 100_000_000
                     elif "error" in data:
@@ -74,23 +71,18 @@ class BalanceTracker:
         if self.session_start_balance > 0:
             print(f"[INFO] Starting balance: {self.session_start_balance} KRX")
         else:
-            print(f"[INFO] Balance query not available, reward will be shown as '~' (estimated)")
+            print(f"[INFO] Balance query belum tersedia (node belum sync / RPC off)")
 
-    async def get_block_reward(self) -> tuple[float, bool]:
-        """
-        Get reward for latest block by checking balance difference.
-        Returns (reward, is_actual) - is_actual=False means it's unknown/estimated.
-        """
-        await asyncio.sleep(3)  # Tunggu agar balance terupdate di node
+    async def get_block_reward(self) -> float:
+        """Get reward by checking balance difference after block found."""
+        await asyncio.sleep(3)
         new_balance = await self.get_balance()
         if new_balance > 0 and self.last_balance is not None:
             reward = round(new_balance - self.last_balance, 8)
             self.last_balance = new_balance
             if reward > 0:
-                return reward, True
-
-        # Tidak bisa tentukan reward aktual
-        return 0.0, False
+                return reward
+        return 0.0
 
     def get_session_earned(self) -> float:
         """Get total earned this session from balance diff."""
@@ -111,10 +103,9 @@ class SessionStats:
         self.last_hashrate = "N/A"
         self.last_block_hash = ""
 
-    def add_block(self, block_hash: str, reward: float = 0.0, is_actual: bool = True):
+    def add_block(self, block_hash: str, reward: float = 0.0):
         self.blocks_found += 1
-        if is_actual and reward > 0:
-            self.total_earned = round(self.total_earned + reward, 8)
+        self.total_earned = round(self.total_earned + reward, 2)
         self.last_block_hash = block_hash
 
     def update_hashrate(self, hashrate: str):
@@ -147,23 +138,16 @@ class TelegramNotifier:
         except Exception as e:
             print(f"[ERROR] Gagal kirim ke Telegram: {e}")
 
-    async def send_block_found(
-        self, stats: SessionStats, hashrate_line: str, block_line: str, reward: float, is_actual: bool
-    ):
+    async def send_block_found(self, stats: SessionStats, hashrate_line: str, block_line: str):
         """Format and send block found notification."""
-        if stats.total_earned > 0:
-            earned_text = f"💰 Earned this session: {stats.total_earned} KRX"
-        elif is_actual and reward > 0:
-            earned_text = f"� Earned this session: {reward} KRX"
-        else:
-            earned_text = "� Earned this session: (calculating...)"
+        earned_text = f"{stats.total_earned} KRX" if stats.total_earned > 0 else "querying..."
 
         message = (
             f"🚀 <b>KERYX BLOCK FOUND</b>\n\n"
             f"⚡ {hashrate_line}\n\n"
             f"⛏ {block_line}\n\n"
             f"🍥 Block this session: {stats.blocks_found}\n\n"
-            f"{earned_text}"
+            f"💰 Earned this session: {earned_text}"
         )
         await self.send_message(message)
 
@@ -172,9 +156,7 @@ class TelegramNotifier:
         message = (
             f"✅ <b>Keryx Monitor Bot Started</b>\n\n"
             f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"⚙️ Mode: {MODE}\n"
-            f"📍 Address: <code>{MINING_ADDRESS[:20]}...</code>\n"
-            f"💎 Reward: dynamic (from node RPC)"
+            f"⚙️ Mode: {MODE}"
         )
         await self.send_message(message)
 
@@ -182,26 +164,22 @@ class TelegramNotifier:
 class LogParser:
     """Parse keryx miner log lines."""
 
-    # Pattern: [timestamp INFO keryx_miner::miner] Current hashrate is XXX Mhash/Ghash
+    # [timestamp INFO keryx_miner::miner] Current hashrate is XXX Mhash/Ghash
     HASHRATE_PATTERN = re.compile(
         r"\[(.+?)\s+INFO\s+keryx_miner::miner\]\s+Current hashrate is (.+)"
     )
 
-    # Pattern: [timestamp INFO keryx_miner::pow] Found a block: HASH
+    # [timestamp INFO keryx_miner::pow] Found a block: HASH
     BLOCK_PATTERN = re.compile(
         r"\[(.+?)\s+INFO\s+keryx_miner::pow\]\s+Found a block:\s+(\w+)"
     )
 
     def parse_line(self, line: str):
-        """
-        Parse a log line and return tuple (type, data).
-        type: 'hashrate' | 'block' | None
-        """
+        """Parse a log line. Returns (type, data) or (None, None)."""
         line = line.strip()
         if not line:
             return None, None
 
-        # Check for hashrate
         match = self.HASHRATE_PATTERN.search(line)
         if match:
             return "hashrate", {
@@ -210,7 +188,6 @@ class LogParser:
                 "raw": line,
             }
 
-        # Check for block found
         match = self.BLOCK_PATTERN.search(line)
         if match:
             return "block", {
@@ -244,39 +221,37 @@ class MinerMonitor:
 
         elif line_type == "block":
             # Query reward dari node (balance diff)
-            reward, is_actual = await self.balance_tracker.get_block_reward()
+            reward = await self.balance_tracker.get_block_reward()
 
-            self.stats.add_block(data["hash"], reward, is_actual)
+            self.stats.add_block(data["hash"], reward)
 
-            # Update total dari balance tracker jika available
+            # Update total dari balance tracker
             session_earned = self.balance_tracker.get_session_earned()
             if session_earned > 0:
-                self.stats.total_earned = round(session_earned, 8)
+                self.stats.total_earned = round(session_earned, 2)
 
-            reward_display = f"{reward} KRX" if is_actual and reward > 0 else "pending"
             print(
                 f"[BLOCK #{self.stats.blocks_found}] {data['hash']} "
-                f"| Reward: {reward_display} | Total: {self.stats.total_earned} KRX"
+                f"| Reward: {reward} KRX | Total: {self.stats.total_earned} KRX"
             )
 
-            # Send Telegram notification
             await self.notifier.send_block_found(
                 self.stats,
                 hashrate_line=self.last_hashrate_line,
                 block_line=data["raw"],
-                reward=reward,
-                is_actual=is_actual,
             )
 
     async def monitor_pipe(self):
         """Run miner as subprocess and monitor stdout."""
         print(f"[INFO] Starting miner: {MINER_EXECUTABLE}")
+        print(f"[INFO] Args: {MINER_ARGS}")
         cmd = [MINER_EXECUTABLE] + MINER_ARGS
 
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            env=MINER_ENV,
         )
 
         print(f"[INFO] Miner started with PID: {process.pid}")
@@ -300,7 +275,6 @@ class MinerMonitor:
         """Monitor a log file (tail -f style)."""
         print(f"[INFO] Monitoring log file: {LOG_FILE_PATH}")
 
-        # Wait for file to exist
         while not os.path.exists(LOG_FILE_PATH) and self.running:
             print(f"[WAIT] Log file not found, waiting... ({LOG_FILE_PATH})")
             await asyncio.sleep(2)
@@ -309,7 +283,6 @@ class MinerMonitor:
             return
 
         with open(LOG_FILE_PATH, "r", encoding="utf-8", errors="replace") as f:
-            # Seek to end
             f.seek(0, 2)
             print(f"[INFO] Tailing log file from end...")
 
@@ -327,15 +300,10 @@ class MinerMonitor:
         print("=" * 50)
         print(f"  Mode: {MODE}")
         print(f"  Chat ID: {TELEGRAM_CHAT_ID}")
-        print(f"  Address: {MINING_ADDRESS[:30]}...")
         print(f"  Node RPC: {KERYX_NODE_RPC}")
-        print(f"  Reward: dynamic (from node balance diff)")
         print("=" * 50)
 
-        # Init balance tracker
         await self.balance_tracker.init_session()
-
-        # Send startup notification
         await self.notifier.send_startup()
 
         if MODE == "pipe":

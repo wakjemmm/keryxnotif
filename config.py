@@ -16,8 +16,8 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 # ============================================
 # MODE OPERASI
 # ============================================
+# "pipe"    = Bot menjalankan miner dan membaca stdout langsung (RECOMMENDED)
 # "logfile" = Bot memonitor file log miner
-# "pipe"    = Bot menjalankan miner dan membaca stdout langsung (RECOMMENDED untuk VPS)
 MODE = os.getenv("MODE", "pipe")
 
 # ============================================
@@ -29,18 +29,24 @@ LOG_FILE_PATH = os.getenv("LOG_FILE_PATH", "/root/keryx-miner/miner.log")
 # KONFIGURASI PIPE MODE
 # ============================================
 MINER_EXECUTABLE = os.getenv("MINER_EXECUTABLE", "/root/keryx-miner/target/release/keryx-miner")
+
+# Miner arguments
+# --cuda-workload: intensitas GPU (makin tinggi makin kencang, coba 256/512/1024)
+# --threads 0: disable CPU mining, full GPU only
 MINER_ARGS = [
-    "--mining-address",
-    os.getenv("MINING_ADDRESS", "keryx:"),
+    "--mining-address", os.getenv("MINING_ADDRESS", ""),
+    "--cuda-workload", os.getenv("CUDA_WORKLOAD", "1024"),
 ]
 
-# ============================================
-# KONFIGURASI REWARD
-# ============================================
-# Reward dihitung otomatis dari selisih balance (query node RPC).
-# Tidak ada fixed reward — setiap block bisa beda reward-nya.
+# LD_LIBRARY_PATH yang dibutuhkan miner (CUDA + libs)
+MINER_ENV = os.environ.copy()
+MINER_ENV["LD_LIBRARY_PATH"] = os.getenv(
+    "LD_LIBRARY_PATH",
+    "/usr/lib/x86_64-linux-gnu:/usr/local/cuda-12.6/lib64:/root/keryx-miner/target/release"
+)
 
+# ============================================
+# KONFIGURASI NODE RPC (untuk query balance)
+# ============================================
 KERYX_NODE_RPC = os.getenv("KERYX_NODE_RPC", "http://127.0.0.1:24110")
-
-# Mining address (untuk query balance)
-MINING_ADDRESS = os.getenv("MINING_ADDRESS", "keryx:")
+MINING_ADDRESS = os.getenv("MINING_ADDRESS", "")

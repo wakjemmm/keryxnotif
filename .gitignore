@@ -1,10 +1,4 @@
-# Python
+.env
 __pycache__/
 *.pyc
-venv/
-
-# Logs
-*.log
-
-# Local config (jika pakai .env atau config lokal)
-.env
+miner.log
